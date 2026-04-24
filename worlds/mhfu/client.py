@@ -1147,52 +1147,6 @@ async def game_watcher(ctx: MHFUContext) -> None:
                     # we're on a hunt, pop traps and check deathlink
                     current_action = (await ctx.ppsspp_read_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
                                                                      "CURRENT_ACTION", 16))["value"]
-No editor do GitHub, com o client.py aberto em modo edição, faz estas 3 alterações cirúrgicas:
-
-Alteração 1 — Adicionar constantes do fix
-Ctrl+F (ou Ctrl+G dependendo do browser) no editor do GitHub e procura por esta linha (deve estar por volta da linha 220):
-
-    19: 0x0002,  # Trip
-}
-Depois do } de fechar, adiciona um Enter e cola este bloco:
-
-
-# DeathLink cart detection.
-# The game stores SET_ACTION in big-endian, but PPSSPP read_u16 returns
-# little-endian, so what we see here is the byte-swapped value of whatever
-# the game actually set. ACTIONS[-1] = 0x0003 is written to force a cart,
-# and when the game carts naturally it also ends up with the same byte
-# pattern in memory, so the LE read returns 0x0003.
-# If 0x0003 ever proves wrong for your build, just add other candidates
-# to CART_ACTION_CANDIDATES below (see debug log) and the client will
-# treat any of them as "player is carting".
-CART_ACTION_CANDIDATES = {0x0003}
-
-# Debug: when True, logs every change on SET_ACTION while on a hunt.
-# Use this to discover the real cart action value: cart 1 time with this
-# flag enabled and check the Archipelago console for the value that
-# appears right before the "You have fainted" cutscene.
-DEATHLINK_DEBUG = True
-A linha imediatamente seguinte tem que ser KEY_OFFSETS = {.
-
-Alteração 2 — Adicionar atributo à classe
-Procura por esta linha exata:
-
-    death_state: DeathState = DeathState.alive
-Só tem uma ocorrência no ficheiro. Logo depois dela, adiciona uma nova linha:
-
-    _last_action_logged: int = -1
-Fica assim no final:
-
-    # intermittent
-    randomize_quest: bool = True
-    death_state: DeathState = DeathState.alive
-    _last_action_logged: int = -1
-Alteração 3 — Substituir o bloco bugado do DeathLink (mais importante)
-Procura por este bloco (usa o Ctrl+F com a primeira linha única, if current_action == 0x0300 and ctx.death_link == 1:):
-
-APAGA este bloco inteiro:
-
                     if current_action == 0x0300 and ctx.death_link == 1:
                         if ctx.death_state == DeathState.alive:
                             await ctx.send_death(f"{ctx.player_names[ctx.slot]} carted.")
@@ -1208,8 +1162,6 @@ APAGA este bloco inteiro:
                             else:
                                 ctx.death_state = DeathState.alive
                         await ctx.pop_trap()
-E COLA este no lugar (mantém a indentação igual — são 20 espaços no início das linhas mais externas):
-
                     # --- DEATHLINK DEBUG LOG ---------------------------------
                     # Logs every time SET_ACTION changes while on a hunt.
                     # Use it to discover the real cart value: when your hunter
