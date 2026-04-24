@@ -221,6 +221,23 @@ ACTIONS = {
     19: 0x0002,  # Trip
 }
 
+# DeathLink cart detection.
+# The game stores SET_ACTION in big-endian, but PPSSPP read_u16 returns
+# little-endian, so what we see here is the byte-swapped value of whatever
+# the game actually set. ACTIONS[-1] = 0x0003 is written to force a cart,
+# and when the game carts naturally it also ends up with the same byte
+# pattern in memory, so the LE read returns 0x0003.
+# If 0x0003 ever proves wrong for your build, just add other candidates
+# to CART_ACTION_CANDIDATES below (see debug log) and the client will
+# treat any of them as "player is carting".
+CART_ACTION_CANDIDATES = {0x0003}
+
+# Debug: when True, logs every change on SET_ACTION while on a hunt.
+# Use this to discover the real cart action value: cart 1 time with this
+# flag enabled and check the Archipelago console for the value that
+# appears right before the "You have fainted" cutscene.
+DEATHLINK_DEBUG = True
+
 KEY_OFFSETS = {
     # hub, rank, star: offset size
     (0, 1, 0): 0,
@@ -598,6 +615,7 @@ class MHFUContext(CommonContext):
     # intermittent
     randomize_quest: bool = True
     death_state: DeathState = DeathState.alive
+    _last_action_logged: int = -1
 
     async def ppsspp_read_bytes(self, offset: int, length: int, ticket: str) -> dict[str, Any]:
         result = await send_and_receive(self, json.dumps({
@@ -1129,6 +1147,52 @@ async def game_watcher(ctx: MHFUContext) -> None:
                     # we're on a hunt, pop traps and check deathlink
                     current_action = (await ctx.ppsspp_read_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
                                                                      "CURRENT_ACTION", 16))["value"]
+No editor do GitHub, com o client.py aberto em modo edição, faz estas 3 alterações cirúrgicas:
+
+Alteração 1 — Adicionar constantes do fix
+Ctrl+F (ou Ctrl+G dependendo do browser) no editor do GitHub e procura por esta linha (deve estar por volta da linha 220):
+
+    19: 0x0002,  # Trip
+}
+Depois do } de fechar, adiciona um Enter e cola este bloco:
+
+
+# DeathLink cart detection.
+# The game stores SET_ACTION in big-endian, but PPSSPP read_u16 returns
+# little-endian, so what we see here is the byte-swapped value of whatever
+# the game actually set. ACTIONS[-1] = 0x0003 is written to force a cart,
+# and when the game carts naturally it also ends up with the same byte
+# pattern in memory, so the LE read returns 0x0003.
+# If 0x0003 ever proves wrong for your build, just add other candidates
+# to CART_ACTION_CANDIDATES below (see debug log) and the client will
+# treat any of them as "player is carting".
+CART_ACTION_CANDIDATES = {0x0003}
+
+# Debug: when True, logs every change on SET_ACTION while on a hunt.
+# Use this to discover the real cart action value: cart 1 time with this
+# flag enabled and check the Archipelago console for the value that
+# appears right before the "You have fainted" cutscene.
+DEATHLINK_DEBUG = True
+A linha imediatamente seguinte tem que ser KEY_OFFSETS = {.
+
+Alteração 2 — Adicionar atributo à classe
+Procura por esta linha exata:
+
+    death_state: DeathState = DeathState.alive
+Só tem uma ocorrência no ficheiro. Logo depois dela, adiciona uma nova linha:
+
+    _last_action_logged: int = -1
+Fica assim no final:
+
+    # intermittent
+    randomize_quest: bool = True
+    death_state: DeathState = DeathState.alive
+    _last_action_logged: int = -1
+Alteração 3 — Substituir o bloco bugado do DeathLink (mais importante)
+Procura por este bloco (usa o Ctrl+F com a primeira linha única, if current_action == 0x0300 and ctx.death_link == 1:):
+
+APAGA este bloco inteiro:
+
                     if current_action == 0x0300 and ctx.death_link == 1:
                         if ctx.death_state == DeathState.alive:
                             await ctx.send_death(f"{ctx.player_names[ctx.slot]} carted.")
@@ -1142,6 +1206,45 @@ async def game_watcher(ctx: MHFUContext) -> None:
                                                                 ACTIONS[-1], "SET_DEATH", 16)
                                 ctx.death_state = DeathState.dead
                             else:
+                                ctx.death_state = DeathState.alive
+                        await ctx.pop_trap()
+E COLA este no lugar (mantém a indentação igual — são 20 espaços no início das linhas mais externas):
+
+                    # --- DEATHLINK DEBUG LOG ---------------------------------
+                    # Logs every time SET_ACTION changes while on a hunt.
+                    # Use it to discover the real cart value: when your hunter
+                    # actually carts, look at the last value printed here
+                    # right before the "You have fainted" cutscene.
+                    if DEATHLINK_DEBUG and current_action != ctx._last_action_logged:
+                        ppsspp_logger.info(
+                            f"[DL-DEBUG] SET_ACTION changed: 0x{current_action:04X} "
+                            f"(death_state={ctx.death_state.name}, death_link={ctx.death_link})"
+                        )
+                        ctx._last_action_logged = current_action
+                    # ---------------------------------------------------------
+
+                    if current_action in CART_ACTION_CANDIDATES and ctx.death_link == 1:
+                        # Player is carting (or we just wrote the kill action).
+                        if ctx.death_state == DeathState.alive:
+                            # Real natural cart -> announce to the multiworld.
+                            await ctx.send_death(f"{ctx.player_names[ctx.slot]} carted.")
+                            ctx.death_state = DeathState.dead
+                        # IMPORTANT: if death_state is killing_player we must NOT
+                        # flip to dead here, otherwise the kill write in the else
+                        # branch never runs and the received DeathLink is dropped.
+                        # We just wait one tick until the game leaves this action
+                        # state (or we write the kill ourselves below).
+                    else:
+                        if ctx.death_link == 1:
+                            if ctx.death_state == DeathState.killing_player:
+                                await ctx.ppsspp_write_unsigned(MHFU_POINTERS[ctx.lang]["RESET_ACTION"], 1,
+                                                                "RESET_DEATH")
+                                await ctx.ppsspp_write_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
+                                                                ACTIONS[-1], "SET_DEATH", 16)
+                                ctx.death_state = DeathState.dead
+                            elif ctx.death_state == DeathState.dead:
+                                # We only reset to alive once the game is clearly
+                                # out of any cart-related action state.
                                 ctx.death_state = DeathState.alive
                         await ctx.pop_trap()
                 else:
