@@ -232,6 +232,17 @@ ACTIONS = {
 # treat any of them as "player is carting".
 CART_ACTION_CANDIDATES = {0x0003}
 
+# Debounce: SET_ACTION briefly passes through cart-like values during
+# many normal animations (drawing the weapon, some attacks, knockdowns,
+# trip=0x0002 which is adjacent to kill=0x0003). A real cart keeps the
+# value stable for the full "You have fainted" cutscene (several seconds).
+# Require CART_CONFIRM_TICKS consecutive ticks in a cart value before we
+# actually report a DeathLink. Each tick is the game_watcher interval
+# (~0.125s), so 4 ticks = ~0.5s of stable cart action.
+# Increase this if you still see false DeathLinks during attacks/draws.
+# Decrease it (minimum 1) if your real cart is not being detected.
+CART_CONFIRM_TICKS = 4
+
 # Debug: when True, logs every change on SET_ACTION while on a hunt.
 # Use this to discover the real cart action value: cart 1 time with this
 # flag enabled and check the Archipelago console for the value that
@@ -612,10 +623,11 @@ class MHFUContext(CommonContext):
     allowed_traps: list[int] = []
     guild_card_awards: bool = False
 
-    # intermittent
+# intermittent
     randomize_quest: bool = True
     death_state: DeathState = DeathState.alive
     _last_action_logged: int = -1
+    _cart_confirm_ticks: int = 0
 
     async def ppsspp_read_bytes(self, offset: int, length: int, ticket: str) -> dict[str, Any]:
         result = await send_and_receive(self, json.dumps({
@@ -1143,6 +1155,89 @@ async def game_watcher(ctx: MHFUContext) -> None:
                                                     "WRITE_NARGA_HYPNOC")
                     ctx.set_cutscene = None
                 await ctx.pop_item()
+Encontrei 3 problemas no arquivo worlds/mhfu/client.py (branch mhfu-deathlink-fix, commit MHFU_Fix_Deathlink.02):
+
+Problema 1 — BLOCO DE LÓGICA DUPLICADO (o mais grave)
+Nas linhas 1147-1205 existem dois blocos quase idênticos de detecção de cart rodando em sequência a cada tick:
+
+Bloco A (linhas 1150-1164) compara current_action == 0x0300
+Bloco B (linhas 1178-1201) compara current_action in CART_ACTION_CANDIDATES (que é {0x0003})
+Isso é resíduo de um refactor mal feito. Como ambos valores (0x0300 e 0x0003) aparecem de forma transitória em animações normais (sacar arma, certos ataques, knockback, trip — que é 0x0002, valor vizinho ao 0x0003), qualquer um dos blocos dispara falso deathlink.
+
+Problema 2 — A recepção de deathlink é silenciosamente descartada
+Quando outro jogador envia deathlink, death_state vira killing_player. Mas se nesse mesmo tick o jogo estiver passando por current_action == 0x0300 (ex: você está atacando), o Bloco A muda o estado para dead sem escrever a kill. O Bloco B então vê dead e também não escreve. O deathlink recebido é perdido. É exatamente o que você relatou: "eu nao recebia deathlink dos outros".
+
+Problema 3 — Sem debounce
+SET_ACTION passa por muitos valores transitórios durante animações. Sem debounce, qualquer passagem momentânea pelo valor de cart dispara deathlink.
+
+✅ Correção proposta
+Vou entregar o patch final. Você precisa editar apenas 1 arquivo: worlds/mhfu/client.py.
+
+Mudança 1 — Adicionar constante de debounce (perto da linha 233)
+Localize este bloco (linhas 224-239):
+
+# DeathLink cart detection.
+# The game stores SET_ACTION in big-endian, but PPSSPP read_u16 returns
+# little-endian, so what we see here is the byte-swapped value of whatever
+# the game actually set. ACTIONS[-1] = 0x0003 is written to force a cart,
+# and when the game carts naturally it also ends up with the same byte
+# pattern in memory, so the LE read returns 0x0003.
+# If 0x0003 ever proves wrong for your build, just add other candidates
+# to CART_ACTION_CANDIDATES below (see debug log) and the client will
+# treat any of them as "player is carting".
+CART_ACTION_CANDIDATES = {0x0003}
+
+# Debug: when True, logs every change on SET_ACTION while on a hunt.
+# Use this to discover the real cart action value: cart 1 time with this
+# flag enabled and check the Archipelago console for the value that
+# appears right before the "You have fainted" cutscene.
+DEATHLINK_DEBUG = True
+Substitua por:
+
+# DeathLink cart detection.
+# The game stores SET_ACTION in big-endian, but PPSSPP read_u16 returns
+# little-endian, so what we see here is the byte-swapped value of whatever
+# the game actually set. ACTIONS[-1] = 0x0003 is written to force a cart,
+# and when the game carts naturally it also ends up with the same byte
+# pattern in memory, so the LE read returns 0x0003.
+# If 0x0003 ever proves wrong for your build, just add other candidates
+# to CART_ACTION_CANDIDATES below (see debug log) and the client will
+# treat any of them as "player is carting".
+CART_ACTION_CANDIDATES = {0x0003}
+
+# Debounce: SET_ACTION briefly passes through cart-like values during
+# many normal animations (drawing the weapon, some attacks, knockdowns,
+# trip=0x0002 which is adjacent to kill=0x0003). A real cart keeps the
+# value stable for the full "You have fainted" cutscene (several seconds).
+# Require CART_CONFIRM_TICKS consecutive ticks in a cart value before we
+# actually report a DeathLink. Each tick is the game_watcher interval
+# (~0.125s), so 4 ticks = ~0.5s of stable cart action.
+# Increase this if you still see false DeathLinks during attacks/draws.
+# Decrease it (minimum 1) if your real cart is not being detected.
+CART_CONFIRM_TICKS = 4
+
+# Debug: when True, logs every change on SET_ACTION while on a hunt.
+# Use this to discover the real cart action value: cart 1 time with this
+# flag enabled and check the Archipelago console for the value that
+# appears right before the "You have fainted" cutscene.
+DEATHLINK_DEBUG = True
+Mudança 2 — Adicionar contador de debounce na classe (perto da linha 618)
+Localize:
+
+    # intermittent
+    randomize_quest: bool = True
+    death_state: DeathState = DeathState.alive
+    _last_action_logged: int = -1
+Substitua por:
+
+    # intermittent
+    randomize_quest: bool = True
+    death_state: DeathState = DeathState.alive
+    _last_action_logged: int = -1
+    _cart_confirm_ticks: int = 0
+Mudança 3 — Substituir TODO o bloco de deathlink duplicado
+Localize este bloco (linhas 1146-1205 — note que são duas versões quase iguais rodando em série):
+
                 if current_overlay["value"] in ("game_task.ovl", "arcade_task.ovl"):
                     # we're on a hunt, pop traps and check deathlink
                     current_action = (await ctx.ppsspp_read_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
@@ -1203,6 +1298,76 @@ async def game_watcher(ctx: MHFUContext) -> None:
                     # if we're not in a hunt, we just need to reset deathlinks
                     if ctx.death_state != DeathState.alive:
                         ctx.death_state = DeathState.alive
+Substitua por esta versão corrigida:
+
+                if current_overlay["value"] in ("game_task.ovl", "arcade_task.ovl"):
+                    # we're on a hunt, pop traps and check deathlink
+                    current_action = (await ctx.ppsspp_read_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
+                                                                     "CURRENT_ACTION", 16))["value"]
+
+                    # --- DEATHLINK DEBUG LOG ---------------------------------
+                    # Logs every change in SET_ACTION while on a hunt. Useful
+                    # to discover which value really corresponds to a cart on
+                    # your build: cart once with DEATHLINK_DEBUG=True and look
+                    # at the last stable value right before the "You have
+                    # fainted" cutscene.
+                    if DEATHLINK_DEBUG and current_action != ctx._last_action_logged:
+                        ppsspp_logger.info(
+                            f"[DL-DEBUG] SET_ACTION changed: 0x{current_action:04X} "
+                            f"(death_state={ctx.death_state.name}, death_link={ctx.death_link}, "
+                            f"confirm_ticks={ctx._cart_confirm_ticks})"
+                        )
+                        ctx._last_action_logged = current_action
+                    # ---------------------------------------------------------
+
+                    if ctx.death_link == 1:
+                        # 1) HIGH PRIORITY: if another player sent us a
+                        # DeathLink, force the kill action immediately,
+                        # regardless of what the current SET_ACTION is.
+                        # Doing this BEFORE the cart-detection below is
+                        # essential: otherwise an in-flight attack / draw-
+                        # weapon animation whose action value coincides with
+                        # a cart value would flip our state to `dead` and
+                        # the received DeathLink would be silently dropped.
+                        if ctx.death_state == DeathState.killing_player:
+                            await ctx.ppsspp_write_unsigned(MHFU_POINTERS[ctx.lang]["RESET_ACTION"], 1,
+                                                            "RESET_DEATH")
+                            await ctx.ppsspp_write_unsigned(MHFU_POINTERS[ctx.lang]["SET_ACTION"],
+                                                            ACTIONS[-1], "SET_DEATH", 16)
+                            ctx.death_state = DeathState.dead
+                            ctx._cart_confirm_ticks = 0
+
+                        # 2) Cart detection with debounce. SET_ACTION passes
+                        # through cart-like values (0x0003, neighbor 0x0002
+                        # for trip, etc.) during several normal animations
+                        # such as drawing the weapon, certain attack startups
+                        # and knockdowns. These are very short (a few frames)
+                        # while a real cart keeps the value stable for the
+                        # whole "You have fainted" cutscene. Only report a
+                        # DeathLink after CART_CONFIRM_TICKS consecutive
+                        # ticks in a cart value.
+                        elif current_action in CART_ACTION_CANDIDATES:
+                            ctx._cart_confirm_ticks += 1
+                            if (ctx._cart_confirm_ticks >= CART_CONFIRM_TICKS
+                                    and ctx.death_state == DeathState.alive):
+                                await ctx.send_death(f"{ctx.player_names[ctx.slot]} carted.")
+                                ctx.death_state = DeathState.dead
+                        else:
+                            # SET_ACTION left the cart range: reset the
+                            # debounce counter. If we were marked `dead`
+                            # from a previous cart (ours or a received
+                            # DeathLink), allow the state to go back to
+                            # `alive` so the next cart can be detected.
+                            ctx._cart_confirm_ticks = 0
+                            if ctx.death_state == DeathState.dead:
+                                ctx.death_state = DeathState.alive
+
+                    await ctx.pop_trap()
+                else:
+                    # if we're not in a hunt, just reset deathlink state
+                    if ctx.death_state != DeathState.alive:
+                        ctx.death_state = DeathState.alive
+                    ctx._cart_confirm_ticks = 0
 
                 new_checks = []
                 quest_changed = False
